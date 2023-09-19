@@ -14,12 +14,7 @@ from homeassistant.components.climate import (
     HVACMode,
 )
 from homeassistant.config_entries import ConfigEntry
-from homeassistant.const import (
-    ATTR_TEMPERATURE,
-    TEMP_CELSIUS,
-    TEMP_FAHRENHEIT,
-    Platform,
-)
+from homeassistant.const import ATTR_TEMPERATURE, Platform, UnitOfTemperature
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 
@@ -51,6 +46,7 @@ class VeraThermostat(VeraDevice[veraApi.VeraThermostat], ClimateEntity):
     """Representation of a Vera Thermostat."""
 
     _attr_hvac_modes = SUPPORT_HVAC
+    _attr_fan_modes = FAN_OPERATION_LIST
     _attr_supported_features = (
         ClimateEntityFeature.TARGET_TEMPERATURE | ClimateEntityFeature.FAN_MODE
     )
@@ -84,11 +80,6 @@ class VeraThermostat(VeraDevice[veraApi.VeraThermostat], ClimateEntity):
             return FAN_ON
         return FAN_AUTO
 
-    @property
-    def fan_modes(self) -> list[str] | None:
-        """Return a list of available fan modes."""
-        return FAN_OPERATION_LIST
-
     def set_fan_mode(self, fan_mode: str) -> None:
         """Set new target temperature."""
         if fan_mode == FAN_ON:
@@ -104,9 +95,9 @@ class VeraThermostat(VeraDevice[veraApi.VeraThermostat], ClimateEntity):
         vera_temp_units = self.vera_device.vera_controller.temperature_units
 
         if vera_temp_units == "F":
-            return TEMP_FAHRENHEIT
+            return UnitOfTemperature.FAHRENHEIT
 
-        return TEMP_CELSIUS
+        return UnitOfTemperature.CELSIUS
 
     @property
     def current_temperature(self) -> float | None:

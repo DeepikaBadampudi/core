@@ -1,5 +1,5 @@
 """The tests for the Recorder component."""
-# pylint: disable=protected-access
+
 import datetime
 import importlib
 import sqlite3
@@ -14,6 +14,7 @@ from sqlalchemy.exc import (
     InternalError,
     OperationalError,
     ProgrammingError,
+    SQLAlchemyError,
 )
 from sqlalchemy.orm import Session
 from sqlalchemy.pool import StaticPool
@@ -21,34 +22,35 @@ from sqlalchemy.pool import StaticPool
 from homeassistant.bootstrap import async_setup_component
 from homeassistant.components import persistent_notification as pn, recorder
 from homeassistant.components.recorder import db_schema, migration
-from homeassistant.components.recorder.const import SQLITE_URL_PREFIX
 from homeassistant.components.recorder.db_schema import (
     SCHEMA_VERSION,
     RecorderRuns,
     States,
 )
-from homeassistant.components.recorder.statistics import get_start_time
 from homeassistant.components.recorder.util import session_scope
+from homeassistant.core import HomeAssistant
 from homeassistant.helpers import recorder as recorder_helper
-from homeassistant.setup import setup_component
 import homeassistant.util.dt as dt_util
 
-from .common import async_wait_recording_done, create_engine_test, wait_recording_done
+from .common import async_wait_recording_done, create_engine_test
 
-from tests.common import async_fire_time_changed, get_test_home_assistant
+from tests.common import async_fire_time_changed
 
 ORIG_TZ = dt_util.DEFAULT_TIME_ZONE
 
 
 def _get_native_states(hass, entity_id):
-    with session_scope(hass=hass) as session:
-        return [
-            state.to_native()
-            for state in session.query(States).filter(States.entity_id == entity_id)
-        ]
+    with session_scope(hass=hass, read_only=True) as session:
+        instance = recorder.get_instance(hass)
+        metadata_id = instance.states_meta_manager.get(entity_id, session, True)
+        states = []
+        for dbstate in session.query(States).filter(States.metadata_id == metadata_id):
+            dbstate.entity_id = entity_id
+            states.append(dbstate.to_native())
+        return states
 
 
-async def test_schema_update_calls(hass):
+async def test_schema_update_calls(recorder_db_url: str, hass: HomeAssistant) -> None:
     """Test that schema migrations occur in correct order."""
     assert recorder.util.async_migration_in_progress(hass) is False
 
@@ -61,7 +63,7 @@ async def test_schema_update_calls(hass):
     ) as update:
         recorder_helper.async_initialize_recorder(hass)
         await async_setup_component(
-            hass, "recorder", {"recorder": {"db_url": "sqlite://"}}
+            hass, "recorder", {"recorder": {"db_url": recorder_db_url}}
         )
         await async_wait_recording_done(hass)
 
@@ -71,14 +73,22 @@ async def test_schema_update_calls(hass):
     session_maker = instance.get_session
     update.assert_has_calls(
         [
-            call(hass, engine, session_maker, version + 1, 0)
+            call(instance, hass, engine, session_maker, version + 1, 0)
             for version in range(0, db_schema.SCHEMA_VERSION)
         ]
     )
 
 
-async def test_migration_in_progress(hass):
+async def test_migration_in_progress(recorder_db_url: str, hass: HomeAssistant) -> None:
     """Test that we can check for migration in progress."""
+    if recorder_db_url.startswith("mysql://"):
+        # The database drop at the end of this test currently hangs on MySQL
+        # because the post migration is still in progress in the background
+        # which results in a deadlock in InnoDB. This behavior is not likely
+        # to happen in real life because the database does not get dropped
+        # in normal operation.
+        return
+
     assert recorder.util.async_migration_in_progress(hass) is False
 
     with patch("homeassistant.components.recorder.ALLOW_IN_MEMORY_DB", True), patch(
@@ -87,7 +97,7 @@ async def test_migration_in_progress(hass):
     ):
         recorder_helper.async_initialize_recorder(hass)
         await async_setup_component(
-            hass, "recorder", {"recorder": {"db_url": "sqlite://"}}
+            hass, "recorder", {"recorder": {"db_url": recorder_db_url}}
         )
         await recorder.get_instance(hass).async_migration_event.wait()
         assert recorder.util.async_migration_in_progress(hass) is True
@@ -97,7 +107,9 @@ async def test_migration_in_progress(hass):
     assert recorder.get_instance(hass).schema_version == SCHEMA_VERSION
 
 
-async def test_database_migration_failed(hass):
+async def test_database_migration_failed(
+    recorder_db_url: str, hass: HomeAssistant
+) -> None:
     """Test we notify if the migration fails."""
     assert recorder.util.async_migration_in_progress(hass) is False
 
@@ -115,7 +127,7 @@ async def test_database_migration_failed(hass):
     ) as mock_dismiss:
         recorder_helper.async_initialize_recorder(hass)
         await async_setup_component(
-            hass, "recorder", {"recorder": {"db_url": "sqlite://"}}
+            hass, "recorder", {"recorder": {"db_url": recorder_db_url}}
         )
         hass.states.async_set("my.entity", "on", {})
         hass.states.async_set("my.entity", "off", {})
@@ -128,8 +140,14 @@ async def test_database_migration_failed(hass):
     assert len(mock_dismiss.mock_calls) == 1
 
 
-async def test_database_migration_encounters_corruption(hass):
+async def test_database_migration_encounters_corruption(
+    recorder_db_url: str, hass: HomeAssistant
+) -> None:
     """Test we move away the database if its corrupt."""
+    if recorder_db_url.startswith(("mysql://", "postgresql://")):
+        # This test is specific for SQLite, wiping the database on error only happens
+        # with SQLite.
+        return
 
     assert recorder.util.async_migration_in_progress(hass) is False
 
@@ -137,17 +155,19 @@ async def test_database_migration_encounters_corruption(hass):
     sqlite3_exception.__cause__ = sqlite3.DatabaseError()
 
     with patch("homeassistant.components.recorder.ALLOW_IN_MEMORY_DB", True), patch(
-        "homeassistant.components.recorder.migration.schema_is_current",
-        side_effect=[False, True],
+        "homeassistant.components.recorder.migration._schema_is_current",
+        side_effect=[False],
     ), patch(
         "homeassistant.components.recorder.migration.migrate_schema",
         side_effect=sqlite3_exception,
     ), patch(
         "homeassistant.components.recorder.core.move_away_broken_database"
-    ) as move_away:
+    ) as move_away, patch(
+        "homeassistant.components.recorder.Recorder._schedule_compile_missing_statistics",
+    ):
         recorder_helper.async_initialize_recorder(hass)
         await async_setup_component(
-            hass, "recorder", {"recorder": {"db_url": "sqlite://"}}
+            hass, "recorder", {"recorder": {"db_url": recorder_db_url}}
         )
         hass.states.async_set("my.entity", "on", {})
         hass.states.async_set("my.entity", "off", {})
@@ -157,13 +177,15 @@ async def test_database_migration_encounters_corruption(hass):
     assert move_away.called
 
 
-async def test_database_migration_encounters_corruption_not_sqlite(hass):
+async def test_database_migration_encounters_corruption_not_sqlite(
+    recorder_db_url: str, hass: HomeAssistant
+) -> None:
     """Test we fail on database error when we cannot recover."""
     assert recorder.util.async_migration_in_progress(hass) is False
 
     with patch("homeassistant.components.recorder.ALLOW_IN_MEMORY_DB", True), patch(
-        "homeassistant.components.recorder.migration.schema_is_current",
-        side_effect=[False, True],
+        "homeassistant.components.recorder.migration._schema_is_current",
+        side_effect=[False],
     ), patch(
         "homeassistant.components.recorder.migration.migrate_schema",
         side_effect=DatabaseError("statement", {}, []),
@@ -177,7 +199,7 @@ async def test_database_migration_encounters_corruption_not_sqlite(hass):
     ) as mock_dismiss:
         recorder_helper.async_initialize_recorder(hass)
         await async_setup_component(
-            hass, "recorder", {"recorder": {"db_url": "sqlite://"}}
+            hass, "recorder", {"recorder": {"db_url": recorder_db_url}}
         )
         hass.states.async_set("my.entity", "on", {})
         hass.states.async_set("my.entity", "off", {})
@@ -191,12 +213,17 @@ async def test_database_migration_encounters_corruption_not_sqlite(hass):
     assert len(mock_dismiss.mock_calls) == 1
 
 
-async def test_events_during_migration_are_queued(hass):
+async def test_events_during_migration_are_queued(
+    recorder_db_url: str, hass: HomeAssistant
+) -> None:
     """Test that events during migration are queued."""
 
     assert recorder.util.async_migration_in_progress(hass) is False
 
-    with patch("homeassistant.components.recorder.ALLOW_IN_MEMORY_DB", True,), patch(
+    with patch(
+        "homeassistant.components.recorder.ALLOW_IN_MEMORY_DB",
+        True,
+    ), patch(
         "homeassistant.components.recorder.core.create_engine",
         new=create_engine_test,
     ):
@@ -204,7 +231,7 @@ async def test_events_during_migration_are_queued(hass):
         await async_setup_component(
             hass,
             "recorder",
-            {"recorder": {"db_url": "sqlite://", "commit_interval": 0}},
+            {"recorder": {"db_url": recorder_db_url, "commit_interval": 0}},
         )
         hass.states.async_set("my.entity", "on", {})
         hass.states.async_set("my.entity", "off", {})
@@ -222,7 +249,9 @@ async def test_events_during_migration_are_queued(hass):
     assert len(db_states) == 2
 
 
-async def test_events_during_migration_queue_exhausted(hass):
+async def test_events_during_migration_queue_exhausted(
+    recorder_db_url: str, hass: HomeAssistant
+) -> None:
     """Test that events during migration takes so long the queue is exhausted."""
 
     assert recorder.util.async_migration_in_progress(hass) is False
@@ -230,12 +259,14 @@ async def test_events_during_migration_queue_exhausted(hass):
     with patch("homeassistant.components.recorder.ALLOW_IN_MEMORY_DB", True), patch(
         "homeassistant.components.recorder.core.create_engine",
         new=create_engine_test,
-    ), patch.object(recorder.core, "MAX_QUEUE_BACKLOG", 1):
+    ), patch.object(recorder.core, "MAX_QUEUE_BACKLOG_MIN_VALUE", 1), patch.object(
+        recorder.core, "QUEUE_PERCENTAGE_ALLOWED_AVAILABLE_MEMORY", 0
+    ):
         recorder_helper.async_initialize_recorder(hass)
         await async_setup_component(
             hass,
             "recorder",
-            {"recorder": {"db_url": "sqlite://", "commit_interval": 0}},
+            {"recorder": {"db_url": recorder_db_url, "commit_interval": 0}},
         )
         hass.states.async_set("my.entity", "on", {})
         await hass.async_block_till_done()
@@ -261,10 +292,12 @@ async def test_events_during_migration_queue_exhausted(hass):
 
 
 @pytest.mark.parametrize(
-    "start_version,live",
+    ("start_version", "live"),
     [(0, True), (16, True), (18, True), (22, True), (25, True)],
 )
-async def test_schema_migrate(hass, start_version, live):
+async def test_schema_migrate(
+    recorder_db_url: str, hass: HomeAssistant, start_version, live
+) -> None:
     """Test the full schema migration logic.
 
     We're just testing that the logic can execute successfully here without
@@ -277,6 +310,8 @@ async def test_schema_migrate(hass, start_version, live):
     migration_version = None
     real_migrate_schema = recorder.migration.migrate_schema
     real_apply_update = recorder.migration._apply_update
+    real_create_index = recorder.migration._create_index
+    create_calls = 0
 
     def _create_engine_test(*args, **kwargs):
         """Test version of create_engine that initializes with old schema.
@@ -298,7 +333,7 @@ async def test_schema_migrate(hass, start_version, live):
 
     def _mock_setup_run(self):
         self.run_info = RecorderRuns(
-            start=self.run_history.recording_start, created=dt_util.utcnow()
+            start=self.recorder_runs_manager.recording_start, created=dt_util.utcnow()
         )
 
     def _instrument_migrate_schema(*args):
@@ -313,7 +348,7 @@ async def test_schema_migrate(hass, start_version, live):
 
         # Check and report the outcome of the migration; if migration fails
         # the recorder will silently create a new database.
-        with session_scope(hass=hass) as session:
+        with session_scope(hass=hass, read_only=True) as session:
             res = (
                 session.query(db_schema.SchemaChanges)
                 .order_by(db_schema.SchemaChanges.change_id.desc())
@@ -328,6 +363,17 @@ async def test_schema_migrate(hass, start_version, live):
         migration_stall.wait()
         real_apply_update(*args)
 
+    def _sometimes_failing_create_index(*args):
+        """Make the first index create raise a retryable error to ensure we retry."""
+        if recorder_db_url.startswith("mysql://"):
+            nonlocal create_calls
+            if create_calls < 1:
+                create_calls += 1
+                mysql_exception = OperationalError("statement", {}, [])
+                mysql_exception.orig = Exception(1205, "retryable")
+                raise mysql_exception
+        real_create_index(*args)
+
     with patch("homeassistant.components.recorder.ALLOW_IN_MEMORY_DB", True), patch(
         "homeassistant.components.recorder.core.create_engine",
         new=_create_engine_test,
@@ -341,13 +387,24 @@ async def test_schema_migrate(hass, start_version, live):
     ), patch(
         "homeassistant.components.recorder.migration._apply_update",
         wraps=_instrument_apply_update,
+    ) as apply_update_mock, patch(
+        "homeassistant.components.recorder.util.time.sleep"
+    ), patch(
+        "homeassistant.components.recorder.migration._create_index",
+        wraps=_sometimes_failing_create_index,
     ), patch(
         "homeassistant.components.recorder.Recorder._schedule_compile_missing_statistics",
+    ), patch(
+        "homeassistant.components.recorder.Recorder._process_state_changed_event_into_session",
+    ), patch(
+        "homeassistant.components.recorder.Recorder._process_non_state_changed_event_into_session",
+    ), patch(
+        "homeassistant.components.recorder.Recorder._pre_process_startup_tasks",
     ):
         recorder_helper.async_initialize_recorder(hass)
         hass.async_create_task(
             async_setup_component(
-                hass, "recorder", {"recorder": {"db_url": "sqlite://"}}
+                hass, "recorder", {"recorder": {"db_url": recorder_db_url}}
             )
         )
         await recorder_helper.async_wait_recorder(hass)
@@ -361,124 +418,17 @@ async def test_schema_migrate(hass, start_version, live):
         assert migration_version == db_schema.SCHEMA_VERSION
         assert setup_run.called
         assert recorder.util.async_migration_in_progress(hass) is not True
+        assert apply_update_mock.called
 
 
-def test_set_state_unit(caplog, tmpdir):
-    """Test state unit column is initialized."""
-
-    def _create_engine_29(*args, **kwargs):
-        """Test version of create_engine that initializes with old schema.
-
-        This simulates an existing db with the old schema.
-        """
-        module = "tests.components.recorder.db_schema_29"
-        importlib.import_module(module)
-        old_db_schema = sys.modules[module]
-        engine = create_engine(*args, **kwargs)
-        old_db_schema.Base.metadata.create_all(engine)
-        with Session(engine) as session:
-            session.add(recorder.db_schema.StatisticsRuns(start=get_start_time()))
-            session.add(
-                recorder.db_schema.SchemaChanges(
-                    schema_version=old_db_schema.SCHEMA_VERSION
-                )
-            )
-            session.commit()
-        return engine
-
-    test_db_file = tmpdir.mkdir("sqlite").join("test_run_info.db")
-    dburl = f"{SQLITE_URL_PREFIX}//{test_db_file}"
-
-    module = "tests.components.recorder.db_schema_29"
-    importlib.import_module(module)
-    old_db_schema = sys.modules[module]
-
-    external_energy_metadata_1 = {
-        "has_mean": False,
-        "has_sum": True,
-        "name": "Total imported energy",
-        "source": "test",
-        "statistic_id": "test:total_energy_import_tariff_1",
-        "unit_of_measurement": "kWh",
-    }
-    external_co2_metadata = {
-        "has_mean": True,
-        "has_sum": False,
-        "name": "Fossil percentage",
-        "source": "test",
-        "statistic_id": "test:fossil_percentage",
-        "unit_of_measurement": "%",
-    }
-
-    # Create some statistics_meta with schema version 29
-    with patch.object(recorder, "db_schema", old_db_schema), patch.object(
-        recorder.migration, "SCHEMA_VERSION", old_db_schema.SCHEMA_VERSION
-    ), patch(
-        "homeassistant.components.recorder.core.create_engine", new=_create_engine_29
-    ):
-        hass = get_test_home_assistant()
-        recorder_helper.async_initialize_recorder(hass)
-        setup_component(hass, "recorder", {"recorder": {"db_url": dburl}})
-        wait_recording_done(hass)
-        wait_recording_done(hass)
-
-        with session_scope(hass=hass) as session:
-            session.add(
-                recorder.db_schema.StatisticsMeta.from_meta(external_energy_metadata_1)
-            )
-            session.add(
-                recorder.db_schema.StatisticsMeta.from_meta(external_co2_metadata)
-            )
-
-        with session_scope(hass=hass) as session:
-            tmp = session.query(recorder.db_schema.StatisticsMeta).all()
-            assert len(tmp) == 2
-            assert tmp[0].id == 1
-            assert tmp[0].statistic_id == "test:total_energy_import_tariff_1"
-            assert tmp[0].unit_of_measurement == "kWh"
-            assert not hasattr(tmp[0], "state_unit_of_measurement")
-            assert tmp[1].id == 2
-            assert tmp[1].statistic_id == "test:fossil_percentage"
-            assert tmp[1].unit_of_measurement == "%"
-            assert not hasattr(tmp[1], "state_unit_of_measurement")
-
-        hass.stop()
-        dt_util.DEFAULT_TIME_ZONE = ORIG_TZ
-
-    # Test that the state_unit column is initialized during migration from schema 28
-    hass = get_test_home_assistant()
-    recorder_helper.async_initialize_recorder(hass)
-    setup_component(hass, "recorder", {"recorder": {"db_url": dburl}})
-    hass.start()
-    wait_recording_done(hass)
-    wait_recording_done(hass)
-
-    with session_scope(hass=hass) as session:
-        tmp = session.query(recorder.db_schema.StatisticsMeta).all()
-        assert len(tmp) == 2
-        assert tmp[0].id == 1
-        assert tmp[0].statistic_id == "test:total_energy_import_tariff_1"
-        assert tmp[0].unit_of_measurement == "kWh"
-        assert hasattr(tmp[0], "state_unit_of_measurement")
-        assert tmp[0].state_unit_of_measurement == "kWh"
-        assert tmp[1].id == 2
-        assert tmp[1].statistic_id == "test:fossil_percentage"
-        assert hasattr(tmp[1], "state_unit_of_measurement")
-        assert tmp[1].state_unit_of_measurement == "%"
-        assert tmp[1].state_unit_of_measurement == "%"
-
-    hass.stop()
-    dt_util.DEFAULT_TIME_ZONE = ORIG_TZ
-
-
-def test_invalid_update(hass):
+def test_invalid_update(hass: HomeAssistant) -> None:
     """Test that an invalid new version raises an exception."""
     with pytest.raises(ValueError):
-        migration._apply_update(hass, Mock(), Mock(), -1, 0)
+        migration._apply_update(Mock(), hass, Mock(), Mock(), -1, 0)
 
 
 @pytest.mark.parametrize(
-    ["engine_type", "substr"],
+    ("engine_type", "substr"),
     [
         ("postgresql", "ALTER event_type TYPE VARCHAR(64)"),
         ("mssql", "ALTER COLUMN event_type VARCHAR(64)"),
@@ -486,7 +436,7 @@ def test_invalid_update(hass):
         ("sqlite", None),
     ],
 )
-def test_modify_column(engine_type, substr):
+def test_modify_column(engine_type, substr) -> None:
     """Test that modify column generates the expected query."""
     connection = Mock()
     session = Mock()
@@ -504,9 +454,9 @@ def test_modify_column(engine_type, substr):
         assert not connection.execute.called
 
 
-def test_forgiving_add_column():
+def test_forgiving_add_column(recorder_db_url: str) -> None:
     """Test that add column will continue if column exists."""
-    engine = create_engine("sqlite://", poolclass=StaticPool)
+    engine = create_engine(recorder_db_url, poolclass=StaticPool)
     with Session(engine) as session:
         session.execute(text("CREATE TABLE hello (id int)"))
         instance = Mock()
@@ -517,22 +467,70 @@ def test_forgiving_add_column():
         migration._add_columns(
             instance.get_session, "hello", ["context_id CHARACTER(36)"]
         )
+    engine.dispose()
 
 
-def test_forgiving_add_index():
+def test_forgiving_add_index(recorder_db_url: str) -> None:
     """Test that add index will continue if index exists."""
-    engine = create_engine("sqlite://", poolclass=StaticPool)
+    engine = create_engine(recorder_db_url, poolclass=StaticPool)
     db_schema.Base.metadata.create_all(engine)
     with Session(engine) as session:
         instance = Mock()
         instance.get_session = Mock(return_value=session)
-        migration._create_index(instance.get_session, "states", "ix_states_context_id")
+        migration._create_index(
+            instance.get_session, "states", "ix_states_context_id_bin"
+        )
+    engine.dispose()
+
+
+def test_forgiving_drop_index(
+    recorder_db_url: str, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Test that drop index will continue if index drop fails."""
+    engine = create_engine(recorder_db_url, poolclass=StaticPool)
+    db_schema.Base.metadata.create_all(engine)
+    with Session(engine) as session:
+        instance = Mock()
+        instance.get_session = Mock(return_value=session)
+        migration._drop_index(
+            instance.get_session, "states", "ix_states_context_id_bin"
+        )
+        migration._drop_index(
+            instance.get_session, "states", "ix_states_context_id_bin"
+        )
+
+        with patch(
+            "homeassistant.components.recorder.migration.get_index_by_name",
+            return_value="ix_states_context_id_bin",
+        ), patch.object(
+            session, "connection", side_effect=SQLAlchemyError("connection failure")
+        ):
+            migration._drop_index(
+                instance.get_session, "states", "ix_states_context_id_bin"
+            )
+        assert "Failed to drop index" in caplog.text
+        assert "connection failure" in caplog.text
+        caplog.clear()
+        with patch(
+            "homeassistant.components.recorder.migration.get_index_by_name",
+            return_value="ix_states_context_id_bin",
+        ), patch.object(
+            session, "connection", side_effect=SQLAlchemyError("connection failure")
+        ):
+            migration._drop_index(
+                instance.get_session, "states", "ix_states_context_id_bin", quiet=True
+            )
+        assert "Failed to drop index" not in caplog.text
+        assert "connection failure" not in caplog.text
+    engine.dispose()
 
 
 @pytest.mark.parametrize(
     "exception_type", [OperationalError, ProgrammingError, InternalError]
 )
-def test_forgiving_add_index_with_other_db_types(caplog, exception_type):
+def test_forgiving_add_index_with_other_db_types(
+    caplog: pytest.LogCaptureFixture, exception_type
+) -> None:
     """Test that add index will continue if index exists on mysql and postgres."""
     mocked_index = Mock()
     type(mocked_index).name = "ix_states_context_id"
@@ -560,7 +558,7 @@ class MockPyODBCProgrammingError(Exception):
     """A mock pyodbc error."""
 
 
-def test_raise_if_exception_missing_str():
+def test_raise_if_exception_missing_str() -> None:
     """Test we raise an exception if strings are not present."""
     programming_exc = ProgrammingError("select * from;", Mock(), Mock())
     programming_exc.__cause__ = MockPyODBCProgrammingError(
@@ -575,7 +573,7 @@ def test_raise_if_exception_missing_str():
         migration.raise_if_exception_missing_str(programming_exc, ["not present"])
 
 
-def test_raise_if_exception_missing_empty_cause_str():
+def test_raise_if_exception_missing_empty_cause_str() -> None:
     """Test we raise an exception if strings are not present with an empty cause."""
     programming_exc = ProgrammingError("select * from;", Mock(), Mock())
     programming_exc.__cause__ = MockPyODBCProgrammingError()

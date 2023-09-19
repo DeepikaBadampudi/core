@@ -11,19 +11,15 @@ from homeassistant.const import (
     CONF_DEVICES,
     CONF_UNIT_OF_MEASUREMENT,
     CONF_ZONE,
-    LENGTH_FEET,
-    LENGTH_KILOMETERS,
-    LENGTH_METERS,
-    LENGTH_MILES,
-    LENGTH_YARD,
+    UnitOfLength,
 )
-from homeassistant.core import HomeAssistant, State
+from homeassistant.core import HomeAssistant, State, callback
 import homeassistant.helpers.config_validation as cv
 from homeassistant.helpers.entity import Entity
-from homeassistant.helpers.event import track_state_change
+from homeassistant.helpers.event import async_track_state_change
 from homeassistant.helpers.typing import ConfigType
-from homeassistant.util.distance import convert
 from homeassistant.util.location import distance
+from homeassistant.util.unit_conversion import DistanceConverter
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -42,11 +38,11 @@ DEFAULT_TOLERANCE = 1
 DOMAIN = "proximity"
 
 UNITS = [
-    LENGTH_METERS,
-    LENGTH_KILOMETERS,
-    LENGTH_FEET,
-    LENGTH_YARD,
-    LENGTH_MILES,
+    UnitOfLength.METERS,
+    UnitOfLength.KILOMETERS,
+    UnitOfLength.FEET,
+    UnitOfLength.YARDS,
+    UnitOfLength.MILES,
 ]
 
 ZONE_SCHEMA = vol.Schema(
@@ -66,7 +62,8 @@ CONFIG_SCHEMA = vol.Schema(
 )
 
 
-def setup_proximity_component(
+@callback
+def async_setup_proximity_component(
     hass: HomeAssistant, name: str, config: ConfigType
 ) -> bool:
     """Set up the individual proximity component."""
@@ -93,23 +90,29 @@ def setup_proximity_component(
     )
     proximity.entity_id = f"{DOMAIN}.{proximity_zone}"
 
-    proximity.schedule_update_ha_state()
+    proximity.async_write_ha_state()
 
-    track_state_change(hass, proximity_devices, proximity.check_proximity_state_change)
+    async_track_state_change(
+        hass, proximity_devices, proximity.async_check_proximity_state_change
+    )
 
     return True
 
 
-def setup(hass: HomeAssistant, config: ConfigType) -> bool:
+async def async_setup(hass: HomeAssistant, config: ConfigType) -> bool:
     """Get the zones and offsets from configuration.yaml."""
     for zone, proximity_config in config[DOMAIN].items():
-        setup_proximity_component(hass, zone, proximity_config)
+        async_setup_proximity_component(hass, zone, proximity_config)
 
     return True
 
 
 class Proximity(Entity):
     """Representation of a Proximity."""
+
+    # This entity is legacy and does not have a platform.
+    # We can't fix this easily without breaking changes.
+    _no_platform_reported = True
 
     def __init__(
         self,
@@ -156,10 +159,14 @@ class Proximity(Entity):
         """Return the state attributes."""
         return {ATTR_DIR_OF_TRAVEL: self.dir_of_travel, ATTR_NEAREST: self.nearest}
 
-    def check_proximity_state_change(
-        self, entity: str, old_state: State | None, new_state: State
+    @callback
+    def async_check_proximity_state_change(
+        self, entity: str, old_state: State | None, new_state: State | None
     ) -> None:
         """Perform the proximity checking."""
+        if new_state is None:
+            return
+
         entity_name = new_state.name
         devices_to_calculate = False
         devices_in_zone = ""
@@ -193,7 +200,7 @@ class Proximity(Entity):
             self.dist_to = "not set"
             self.dir_of_travel = "not set"
             self.nearest = "not set"
-            self.schedule_update_ha_state()
+            self.async_write_ha_state()
             return
 
         # At least one device is in the monitored zone so update the entity.
@@ -201,7 +208,7 @@ class Proximity(Entity):
             self.dist_to = 0
             self.dir_of_travel = "arrived"
             self.nearest = devices_in_zone
-            self.schedule_update_ha_state()
+            self.async_write_ha_state()
             return
 
         # We can't check proximity because latitude and longitude don't exist.
@@ -232,7 +239,10 @@ class Proximity(Entity):
             if not proximity:
                 continue
             distances_to_zone[device] = round(
-                convert(proximity, LENGTH_METERS, self.unit_of_measurement), 1
+                DistanceConverter.convert(
+                    proximity, UnitOfLength.METERS, self.unit_of_measurement
+                ),
+                1,
             )
 
         # Loop through each of the distances collected and work out the
@@ -252,7 +262,7 @@ class Proximity(Entity):
             device_state = self.hass.states.get(closest_device)
             assert device_state
             self.nearest = device_state.name
-            self.schedule_update_ha_state()
+            self.async_write_ha_state()
             return
 
         # Stop if we cannot calculate the direction of travel (i.e. we don't
@@ -261,7 +271,7 @@ class Proximity(Entity):
             self.dist_to = round(distances_to_zone[entity])
             self.dir_of_travel = "unknown"
             self.nearest = entity_name
-            self.schedule_update_ha_state()
+            self.async_write_ha_state()
             return
 
         # Reset the variables
@@ -297,7 +307,7 @@ class Proximity(Entity):
         )
         self.dir_of_travel = direction_of_travel
         self.nearest = entity_name
-        self.schedule_update_ha_state()
+        self.async_write_ha_state()
         _LOGGER.debug(
             "proximity.%s update entity: distance=%s: direction=%s: device=%s",
             self.friendly_name,

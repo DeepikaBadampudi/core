@@ -15,7 +15,7 @@ from homeassistant.components.weather import (
     WeatherEntity,
 )
 from homeassistant.config_entries import ConfigEntry
-from homeassistant.const import PRESSURE_HPA, SPEED_MILES_PER_HOUR, TEMP_CELSIUS
+from homeassistant.const import UnitOfPressure, UnitOfSpeed, UnitOfTemperature
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers.update_coordinator import (
@@ -26,16 +26,13 @@ from homeassistant.helpers.update_coordinator import (
 from . import get_device_info
 from .const import (
     ATTRIBUTION,
-    CONDITION_CLASSES,
-    DEFAULT_NAME,
+    CONDITION_MAP,
     DOMAIN,
     METOFFICE_COORDINATES,
     METOFFICE_DAILY_COORDINATOR,
     METOFFICE_HOURLY_COORDINATOR,
     METOFFICE_NAME,
-    MODE_3HOURLY_LABEL,
     MODE_DAILY,
-    MODE_DAILY_LABEL,
 )
 from .data import MetOfficeData
 
@@ -58,7 +55,7 @@ async def async_setup_entry(
 def _build_forecast_data(timestep: Timestep) -> Forecast:
     data = Forecast(datetime=timestep.date.isoformat())
     if timestep.weather:
-        data[ATTR_FORECAST_CONDITION] = _get_weather_condition(timestep.weather.value)
+        data[ATTR_FORECAST_CONDITION] = CONDITION_MAP.get(timestep.weather.value)
     if timestep.precipitation:
         data[ATTR_FORECAST_PRECIPITATION_PROBABILITY] = timestep.precipitation.value
     if timestep.temperature:
@@ -70,23 +67,17 @@ def _build_forecast_data(timestep: Timestep) -> Forecast:
     return data
 
 
-def _get_weather_condition(metoffice_code: str) -> str | None:
-    for hass_name, metoffice_codes in CONDITION_CLASSES.items():
-        if metoffice_code in metoffice_codes:
-            return hass_name
-    return None
-
-
 class MetOfficeWeather(
     CoordinatorEntity[DataUpdateCoordinator[MetOfficeData]], WeatherEntity
 ):
     """Implementation of a Met Office weather condition."""
 
     _attr_attribution = ATTRIBUTION
+    _attr_has_entity_name = True
 
-    _attr_native_temperature_unit = TEMP_CELSIUS
-    _attr_native_pressure_unit = PRESSURE_HPA
-    _attr_native_wind_speed_unit = SPEED_MILES_PER_HOUR
+    _attr_native_temperature_unit = UnitOfTemperature.CELSIUS
+    _attr_native_pressure_unit = UnitOfPressure.HPA
+    _attr_native_wind_speed_unit = UnitOfSpeed.MILES_PER_HOUR
 
     def __init__(
         self,
@@ -97,11 +88,10 @@ class MetOfficeWeather(
         """Initialise the platform with a data instance."""
         super().__init__(coordinator)
 
-        mode_label = MODE_3HOURLY_LABEL if use_3hourly else MODE_DAILY_LABEL
         self._attr_device_info = get_device_info(
             coordinates=hass_data[METOFFICE_COORDINATES], name=hass_data[METOFFICE_NAME]
         )
-        self._attr_name = f"{DEFAULT_NAME} {hass_data[METOFFICE_NAME]} {mode_label}"
+        self._attr_name = "3-Hourly" if use_3hourly else "Daily"
         self._attr_unique_id = hass_data[METOFFICE_COORDINATES]
         if not use_3hourly:
             self._attr_unique_id = f"{self._attr_unique_id}_{MODE_DAILY}"
@@ -110,7 +100,7 @@ class MetOfficeWeather(
     def condition(self) -> str | None:
         """Return the current condition."""
         if self.coordinator.data.now:
-            return _get_weather_condition(self.coordinator.data.now.weather.value)
+            return CONDITION_MAP.get(self.coordinator.data.now.weather.value)
         return None
 
     @property

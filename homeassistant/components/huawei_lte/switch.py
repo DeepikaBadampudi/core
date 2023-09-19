@@ -31,7 +31,7 @@ async def async_setup_entry(
     async_add_entities: AddEntitiesCallback,
 ) -> None:
     """Set up from config entry."""
-    router = hass.data[DOMAIN].routers[config_entry.unique_id]
+    router = hass.data[DOMAIN].routers[config_entry.entry_id]
     switches: list[Entity] = []
 
     if router.data.get(KEY_DIALUP_MOBILE_DATASWITCH):
@@ -69,7 +69,7 @@ class HuaweiLteBaseSwitch(HuaweiLteBaseEntityWithDevice, SwitchEntity):
     async def async_added_to_hass(self) -> None:
         """Subscribe to needed data on add."""
         await super().async_added_to_hass()
-        self.router.subscriptions[self.key].add(f"{SWITCH_DOMAIN}/{self.item}")
+        self.router.subscriptions[self.key].append(f"{SWITCH_DOMAIN}/{self.item}")
 
     async def async_will_remove_from_hass(self) -> None:
         """Unsubscribe from needed data on remove."""

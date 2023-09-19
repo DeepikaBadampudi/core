@@ -1,7 +1,7 @@
 """Component for the Portuguese weather service - IPMA."""
+import asyncio
 import logging
 
-import async_timeout
 from pyipma import IPMAException
 from pyipma.api import IPMA_API
 from pyipma.location import Location
@@ -17,15 +17,9 @@ from .const import DATA_API, DATA_LOCATION, DOMAIN
 
 DEFAULT_NAME = "ipma"
 
-PLATFORMS = [Platform.WEATHER]
+PLATFORMS = [Platform.WEATHER, Platform.SENSOR]
 
 _LOGGER = logging.getLogger(__name__)
-
-
-async def async_get_api(hass):
-    """Get the pyipma api object."""
-    websession = async_get_clientsession(hass)
-    return IPMA_API(websession)
 
 
 async def async_setup_entry(hass: HomeAssistant, config_entry: ConfigEntry) -> bool:
@@ -34,23 +28,24 @@ async def async_setup_entry(hass: HomeAssistant, config_entry: ConfigEntry) -> b
     latitude = config_entry.data[CONF_LATITUDE]
     longitude = config_entry.data[CONF_LONGITUDE]
 
-    api = await async_get_api(hass)
-    try:
-        async with async_timeout.timeout(30):
-            location = await Location.get(api, float(latitude), float(longitude))
+    api = IPMA_API(async_get_clientsession(hass))
 
-        _LOGGER.debug(
-            "Initializing for coordinates %s, %s -> station %s (%d, %d)",
-            latitude,
-            longitude,
-            location.station,
-            location.id_station,
-            location.global_id_local,
-        )
-    except IPMAException as err:
+    try:
+        async with asyncio.timeout(30):
+            location = await Location.get(api, float(latitude), float(longitude))
+    except (IPMAException, asyncio.TimeoutError) as err:
         raise ConfigEntryNotReady(
             f"Could not get location for ({latitude},{longitude})"
         ) from err
+
+    _LOGGER.debug(
+        "Initializing for coordinates %s, %s -> station %s (%d, %d)",
+        latitude,
+        longitude,
+        location.station,
+        location.id_station,
+        location.global_id_local,
+    )
 
     hass.data.setdefault(DOMAIN, {})
     hass.data[DOMAIN][config_entry.entry_id] = {DATA_API: api, DATA_LOCATION: location}
@@ -61,4 +56,11 @@ async def async_setup_entry(hass: HomeAssistant, config_entry: ConfigEntry) -> b
 
 async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     """Unload a config entry."""
-    return await hass.config_entries.async_unload_platforms(entry, PLATFORMS)
+
+    if unload_ok := await hass.config_entries.async_unload_platforms(entry, PLATFORMS):
+        hass.data[DOMAIN].pop(entry.entry_id)
+
+    if not hass.data[DOMAIN]:
+        hass.data.pop(DOMAIN)
+
+    return unload_ok

@@ -1,23 +1,26 @@
 """The Litter-Robot integration."""
 from __future__ import annotations
 
-from pylitterbot import FeederRobot, LitterRobot, LitterRobot3, Robot
+from pylitterbot import FeederRobot, LitterRobot, LitterRobot3, LitterRobot4, Robot
 
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import Platform
 from homeassistant.core import HomeAssistant
+from homeassistant.helpers.device_registry import DeviceEntry
 
 from .const import DOMAIN
 from .hub import LitterRobotHub
 
 PLATFORMS_BY_TYPE = {
     Robot: (
+        Platform.BINARY_SENSOR,
         Platform.SELECT,
         Platform.SENSOR,
         Platform.SWITCH,
     ),
     LitterRobot: (Platform.VACUUM,),
-    LitterRobot3: (Platform.BUTTON,),
+    LitterRobot3: (Platform.BUTTON, Platform.TIME),
+    LitterRobot4: (Platform.UPDATE,),
     FeederRobot: (Platform.BUTTON,),
 }
 
@@ -56,3 +59,17 @@ async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         hass.data[DOMAIN].pop(entry.entry_id)
 
     return unload_ok
+
+
+async def async_remove_config_entry_device(
+    hass: HomeAssistant, config_entry: ConfigEntry, device_entry: DeviceEntry
+) -> bool:
+    """Remove a config entry from a device."""
+    hub: LitterRobotHub = hass.data[DOMAIN][config_entry.entry_id]
+    return not any(
+        identifier
+        for identifier in device_entry.identifiers
+        if identifier[0] == DOMAIN
+        for robot in hub.account.robots
+        if robot.serial == identifier[1]
+    )
